@@ -10,3 +10,6 @@ repository = "https://github.com/fungi-protocol/validate-commits"
 clap = { version = "4", features = ["derive"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3.23.0"
