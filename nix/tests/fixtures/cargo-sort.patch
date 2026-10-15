@@ -1,0 +1,9 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,4 +9,4 @@
+ [dependencies]
++git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+ clap = { version = "4", features = ["derive"] }
+-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+ thiserror = "2"

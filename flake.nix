@@ -21,11 +21,15 @@
         "aarch64-linux"
         "x86_64-linux"
       ];
+      flake.flakeModules.checks = import ./nix/checks;
       imports = [
         ./nix/apps/validate-commits-bootstrap
         ./nix/package.nix
         ./nix/toolchain.nix
         ./nix/treefmt.nix
+        ./nix/checks/cargo-shear.nix
+        ./nix/checks/cargo-sort.nix
+        ./nix/tests/negative-tests.nix
       ];
     };
 }
