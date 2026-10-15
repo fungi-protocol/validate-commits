@@ -27,6 +27,8 @@
       );
     in
     {
+      _module.args = { inherit commonArgs cargoArtifacts; };
+
       checks.default = validate-commits;
 
       packages = {
