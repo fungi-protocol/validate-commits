@@ -1,0 +1,15 @@
+[package]
+name = "validate-commits"
+version = "0.1.0"
+edition = "2024"
+description = "Run Nix flake checks for every commit in a revision range"
+license = "MIT"
+repository = "https://github.com/fungi-protocol/validate-commits"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3.23.0"
