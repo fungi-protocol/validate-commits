@@ -1,5 +1,6 @@
 mod history;
 mod nix;
+mod shallow;
 #[cfg(test)]
 mod test_support;
 
@@ -10,7 +11,7 @@ use std::process::ExitStatus;
 
 pub fn run_revisions(revisions: &[&str], output: &mut impl Write) -> Result<(), Error> {
     let repository = discover_repository()?;
-    let commits = history::resolve_commits(&repository.git_repo, revisions)?;
+    let commits = history::resolve_commits(&repository.git_repo, revisions, output)?;
 
     if commits.is_empty() {
         writeln!(output, "No commits in range.").map_err(Error::WriteOutput)?;
@@ -81,10 +82,20 @@ pub enum Error {
     PeelToCommit(#[source] Source),
     #[error("could not walk the selected history: {0}")]
     WalkHistory(#[source] Source),
+    #[error("could not read a selected commit: {0}")]
+    FindCommit(#[source] Source),
     #[error("only X, ^X and A..B revisions are supported")]
     UnsupportedRevision,
     #[error("could not read shallow history: {0}")]
     ReadShallow(#[source] Source),
+    #[error("could not run git fetch: {0}")]
+    SpawnGit(#[source] std::io::Error),
+    #[error("git fetch failed: {status}")]
+    FetchFailed { status: ExitStatus },
+    #[error("fetch did not supply requested commit {0}")]
+    MissingFetchedCommit(gix::ObjectId),
+    #[error("fetch did not deepen history; origin may itself be shallow")]
+    NoHistoryProgress,
     #[error("could not write output: {0}")]
     WriteOutput(#[source] std::io::Error),
     #[error("could not start Nix while checking commit {commit}: {source}")]
