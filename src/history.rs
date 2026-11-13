@@ -1,7 +1,11 @@
-use git2::{ErrorCode, Object, Oid, Repository, RevparseMode, Revwalk, Sort};
+use gix::revision::plumbing::Spec;
+use gix::{ObjectId, Repository};
+use std::collections::{HashMap, HashSet};
 
-use crate::{CommitId, Error};
+use crate::{CommitId, Context, Error};
 
+// Find the commits to validate: reachable from an included revision but
+// not from an excluded one, with parents before their children.
 pub(crate) fn resolve_commits(
     repo: &Repository,
     revisions: &[&str],
@@ -12,112 +16,159 @@ pub(crate) fn resolve_commits(
         && let Some(revision) = input.strip_suffix("^!")
     {
         // A single-commit selection does not need any parent history.
-        return Ok(vec![CommitId(resolve(repo, revision)?.id())]);
+        let id = repo
+            .rev_parse_single(revision)
+            .context(Error::ParseRevision)?;
+        return Ok(vec![CommitId(commit(repo, id.detach())?)]);
     }
+    let revisions = parse_revisions(repo, revisions, all)?;
+    let history = History::walk(repo, &revisions.include, &revisions.exclude)?;
+    Ok(history.parents_first().into_iter().map(CommitId).collect())
+}
 
-    let mut walk = repo.revwalk().map_err(Error::WalkHistory)?;
-    walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
-        .map_err(Error::WalkHistory)?;
+// The commits named by the arguments, split into included and excluded.
+struct Revisions {
+    include: Vec<ObjectId>,
+    exclude: Vec<ObjectId>,
+}
 
+// gix parses every revision form `git rev-list` accepts. Turn each into
+// commits to include and exclude.
+fn parse_revisions(repo: &Repository, revisions: &[&str], all: bool) -> Result<Revisions, Error> {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
     if all {
-        walk.push_glob("refs/*").map_err(Error::WalkHistory)?;
-        match repo.head() {
-            Ok(head) => {
-                let commit = head.peel_to_commit().map_err(Error::PeelToCommit)?;
-                walk.push(commit.id()).map_err(Error::WalkHistory)?;
+        let references = repo.references().context(Error::WalkHistory)?;
+        for reference in references.all().context(Error::WalkHistory)? {
+            let mut reference = reference.context(Error::WalkHistory)?;
+            // As with `git rev-list --all`, refs to non-commit objects are ignored.
+            if let Ok(commit) = reference.peel_to_commit() {
+                include.push(commit.id);
             }
-            // An empty repository has no HEAD commit to include.
-            Err(error) if error.code() == ErrorCode::UnbornBranch => {}
-            Err(error) => return Err(Error::ParseRevision(error)),
+        }
+        // An empty repository has no HEAD commit to include.
+        if !repo.head().context(Error::ReadHead)?.is_unborn() {
+            include.push(repo.head_commit().context(Error::ReadHead)?.id);
         }
     }
     for input in revisions {
-        add_revision(repo, &mut walk, input)?;
+        let spec = repo.rev_parse(*input).context(Error::ParseRevision)?;
+        match spec.detach() {
+            Spec::Include(id) => include.push(commit(repo, id)?),
+            Spec::Exclude(id) => exclude.push(commit(repo, id)?),
+            Spec::Range { from, to } => {
+                exclude.push(commit(repo, from)?);
+                include.push(commit(repo, to)?);
+            }
+            Spec::Merge { theirs, ours } => {
+                let (theirs, ours) = (commit(repo, theirs)?, commit(repo, ours)?);
+                include.extend([theirs, ours]);
+                // Unrelated histories have no common ancestors to exclude.
+                let bases = repo
+                    .merge_bases_many(theirs, &[ours])
+                    .context(Error::MergeBases)?;
+                exclude.extend(bases.into_iter().map(|id| id.detach()));
+            }
+            Spec::IncludeOnlyParents(id) => include.extend(parents(repo, commit(repo, id)?)?),
+            Spec::ExcludeParents(id) => {
+                let id = commit(repo, id)?;
+                include.push(id);
+                exclude.extend(parents(repo, id)?);
+            }
+        }
     }
-
-    walk.map(|id| id.map(CommitId).map_err(Error::WalkHistory))
-        .collect()
+    Ok(Revisions { include, exclude })
 }
 
-fn add_revision(repo: &Repository, walk: &mut Revwalk<'_>, input: &str) -> Result<(), Error> {
-    // libgit2 parses single revisions and ranges. Expand the remaining
-    // revision-set shorthands into its native push/hide operations.
-    if let Some(revision) = input.strip_prefix('^') {
-        walk.hide(resolve(repo, revision)?.id())
-            .map_err(Error::WalkHistory)?;
-    } else if let Some(revision) = input.strip_suffix("^!") {
-        let commit = resolve(repo, revision)?;
-        walk.push(commit.id()).map_err(Error::WalkHistory)?;
-        for parent in commit.parent_ids() {
-            walk.hide(parent).map_err(Error::WalkHistory)?;
+// Commits reachable from some starting points, and each commit's parents.
+struct History {
+    parents: HashMap<ObjectId, Vec<ObjectId>>,
+}
+
+impl History {
+    fn walk(repo: &Repository, from: &[ObjectId], hide: &[ObjectId]) -> Result<Self, Error> {
+        let mut parents = HashMap::new();
+        let walk = repo
+            .rev_walk(from.iter().copied())
+            .with_hidden(hide.iter().copied())
+            .all()
+            .context(Error::WalkHistory)?;
+        for info in walk {
+            let info = info.context(Error::WalkHistory)?;
+            parents.insert(info.id, info.parent_ids.to_vec());
         }
-    } else if let Some(revision) = input.strip_suffix("^@") {
-        for parent in resolve(repo, revision)?.parent_ids() {
-            walk.push(parent).map_err(Error::WalkHistory)?;
-        }
-    } else {
-        let spec = repo.revparse(input).map_err(Error::ParseRevision)?;
-        let from = peel(spec.from().expect("libgit2 supplies the range start"))?;
-        match spec.mode() {
-            mode if mode.contains(RevparseMode::SINGLE) => {
-                walk.push(from).map_err(Error::WalkHistory)?;
-            }
-            mode if mode.contains(RevparseMode::MERGE_BASE) => {
-                let to = peel(spec.to().expect("libgit2 supplies the range end"))?;
-                walk.push(from).map_err(Error::WalkHistory)?;
-                walk.push(to).map_err(Error::WalkHistory)?;
-                match repo.merge_bases(from, to) {
-                    Ok(bases) => {
-                        for base in bases.iter() {
-                            walk.hide(*base).map_err(Error::WalkHistory)?;
-                        }
+        Ok(Self { parents })
+    }
+
+    fn parents(&self, id: &ObjectId) -> impl Iterator<Item = &ObjectId> {
+        self.parents.get(id).into_iter().flatten()
+    }
+
+    // The walked commits, with every parent before its children. gix's
+    // topological walk can't be used: it loads every parent, which fails at
+    // shallow boundaries.
+    fn parents_first(&self) -> Vec<ObjectId> {
+        let mut ids: Vec<_> = self.parents.keys().copied().collect();
+        ids.sort();
+        let kept: HashSet<_> = ids.iter().copied().collect();
+        let mut order = Vec::with_capacity(ids.len());
+        let mut done = HashSet::new();
+        for id in ids {
+            let mut stack = vec![(id, false)];
+            while let Some((id, expanded)) = stack.pop() {
+                if expanded {
+                    if done.insert(id) {
+                        order.push(id);
                     }
-                    // Unrelated histories have no common ancestors to hide.
-                    Err(error) if error.code() == ErrorCode::NotFound => {}
-                    Err(error) => return Err(Error::MergeBases(error)),
+                    continue;
+                }
+                if done.contains(&id) {
+                    continue;
+                }
+                stack.push((id, true));
+                for parent in self.parents(&id) {
+                    if kept.contains(parent) && !done.contains(parent) {
+                        stack.push((*parent, false));
+                    }
                 }
             }
-            mode if mode.contains(RevparseMode::RANGE) => {
-                let to = peel(spec.to().expect("libgit2 supplies the range end"))?;
-                walk.hide(from).map_err(Error::WalkHistory)?;
-                walk.push(to).map_err(Error::WalkHistory)?;
-            }
-            mode => return Err(Error::UnsupportedRevisionMode(mode)),
         }
+        order
     }
-    Ok(())
 }
 
-fn resolve<'repo>(repo: &'repo Repository, revision: &str) -> Result<git2::Commit<'repo>, Error> {
-    repo.revparse_single(revision)
-        .map_err(Error::ParseRevision)?
-        .peel_to_commit()
-        .map_err(Error::PeelToCommit)
+// Peel an object to its commit, following tags if necessary.
+fn commit(repo: &Repository, id: ObjectId) -> Result<ObjectId, Error> {
+    let object = repo.find_object(id).context(Error::PeelToCommit)?;
+    Ok(object.peel_to_commit().context(Error::PeelToCommit)?.id)
 }
 
-fn peel(object: &Object<'_>) -> Result<Oid, Error> {
-    object
-        .peel_to_commit()
-        .map(|commit| commit.id())
-        .map_err(Error::PeelToCommit)
+fn parents(repo: &Repository, id: ObjectId) -> Result<Vec<ObjectId>, Error> {
+    let commit = repo.find_commit(id).context(Error::FindCommit)?;
+    Ok(commit.parent_ids().map(|id| id.detach()).collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Oid, Repository, resolve_commits};
+    use super::resolve_commits;
+    use crate::Error;
+    use crate::test_support::{commit_as, with_test_identity};
+    use gix::refs::Target;
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+    use gix::{ObjectId, Repository};
     use tempfile::TempDir;
 
     struct History {
         _root: TempDir,
         repository: Repository,
-        commits: Vec<Oid>,
+        commits: Vec<ObjectId>,
     }
 
     impl History {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let repository = Repository::init(root.path()).unwrap();
-            let tree = repository.treebuilder(None).unwrap().write().unwrap();
+            let repository = with_test_identity(gix::init(root.path()).unwrap());
+            let tree = repository.empty_tree().id;
             let mut commits = Vec::new();
             for (timestamp, message) in ["Base", "First", "Second", "Third"].into_iter().enumerate()
             {
@@ -138,36 +189,12 @@ mod tests {
         }
     }
 
-    fn signature(timestamp: i64) -> git2::Signature<'static> {
-        git2::Signature::new("Test", "test@example.com", &git2::Time::new(timestamp, 0)).unwrap()
-    }
-
-    fn commit_as(
-        repository: &Repository,
-        reference: Option<&str>,
-        message: &str,
-        tree: Oid,
-        parents: impl IntoIterator<Item = Oid>,
-        timestamp: i64,
-    ) -> Oid {
-        let signature = signature(timestamp);
-        let tree = repository.find_tree(tree).unwrap();
-        let parents: Vec<_> = parents
-            .into_iter()
-            .map(|id| repository.find_commit(id).unwrap())
-            .collect();
-        let parents: Vec<_> = parents.iter().collect();
-        repository
-            .commit(reference, &signature, &signature, message, &tree, &parents)
-            .unwrap()
-    }
-
-    fn select(fixture: &History, revisions: &[&str], all: bool) -> Result<Vec<Oid>, crate::Error> {
+    fn select(fixture: &History, revisions: &[&str], all: bool) -> Result<Vec<ObjectId>, Error> {
         resolve_commits(&fixture.repository, revisions, all)
             .map(|commits| commits.into_iter().map(|commit| commit.0).collect())
     }
 
-    fn assert_selection(mut actual: Vec<Oid>, expected: &[Oid]) {
+    fn assert_selection(mut actual: Vec<ObjectId>, expected: &[ObjectId]) {
         actual.sort();
         let mut expected = expected.to_vec();
         expected.sort();
@@ -178,8 +205,14 @@ mod tests {
     fn orders_merge_parents_with_skewed_dates() {
         let fixture = History::new();
         let base = fixture.commits[3];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
-        let commit = |message, parents: &[Oid], timestamp| {
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
+        let commit = |message, parents: &[ObjectId], timestamp| {
             commit_as(
                 &fixture.repository,
                 None,
@@ -210,15 +243,21 @@ mod tests {
         // together.
         let fixture = History::new();
         let base = fixture.commits[0];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
         let side = commit_as(&fixture.repository, None, "Side", tree, [base], 100);
         fixture
             .repository
-            .reference("refs/heads/side", side, false, "test")
+            .reference("refs/heads/side", side, PreviousValue::Any, "test")
             .unwrap();
         fixture
             .repository
-            .reference("refs/heads/base", base, false, "test")
+            .reference("refs/heads/base", base, PreviousValue::Any, "test")
             .unwrap();
         let cases = [
             // "^base" leaves out Base and everything before it.
@@ -259,25 +298,43 @@ mod tests {
         // it can only be found through HEAD.
         let fixture = History::new();
         let base = fixture.commits[0];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
         let side = commit_as(&fixture.repository, None, "Side", tree, [base], 100);
         fixture
             .repository
-            .reference("refs/heads/side", side, false, "test")
+            .reference("refs/heads/side", side, PreviousValue::Any, "test")
             .unwrap();
         let tagged = commit_as(&fixture.repository, None, "Tagged", tree, [base], 200);
         fixture
             .repository
             .tag(
                 "release",
-                &fixture.repository.find_object(tagged, None).unwrap(),
-                &signature(200),
+                tagged,
+                gix::objs::Kind::Commit,
+                None,
                 "Release",
-                false,
+                PreviousValue::MustNotExist,
             )
             .unwrap();
         let detached = commit_as(&fixture.repository, None, "Detached", tree, [base], 300);
-        fixture.repository.set_head_detached(detached).unwrap();
+        fixture
+            .repository
+            .edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange::default(),
+                    expected: PreviousValue::Any,
+                    new: Target::Object(detached),
+                },
+                name: "HEAD".try_into().unwrap(),
+                deref: false,
+            })
+            .unwrap();
         let mut expected = fixture.commits.clone();
         expected.extend([side, tagged, detached]);
         let commits = select(&fixture, &[], true).unwrap();
@@ -291,14 +348,24 @@ mod tests {
         // ancestors. Both must be left out, leaving only Left and Right.
         let fixture = History::new();
         let base = fixture.commits[0];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
         let a = commit_as(&fixture.repository, None, "A", tree, [base], 100);
         let b = commit_as(&fixture.repository, None, "B", tree, [base], 900);
         let left = commit_as(&fixture.repository, None, "Left", tree, [a, b], 10);
         let right = commit_as(&fixture.repository, None, "Right", tree, [b, a], 20);
         // Make sure the setup really has two shared ancestors.
         assert_eq!(
-            fixture.repository.merge_bases(left, right).unwrap().len(),
+            fixture
+                .repository
+                .merge_bases_many(left, &[right])
+                .unwrap()
+                .len(),
             2
         );
         let commits = select(&fixture, &[&format!("{left}...{right}")], false).unwrap();

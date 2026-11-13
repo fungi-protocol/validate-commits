@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use git2::{Oid, Repository};
+use gix::{ObjectId, Repository};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ impl Fixture {
             .tempdir()
             .unwrap();
         let repo = root.path().join(name);
-        let repository = Repository::init(&repo).unwrap();
+        let repository = with_test_identity(gix::init(&repo).unwrap());
         Self {
             root,
             repo,
@@ -41,42 +41,36 @@ impl Fixture {
         }
     }
 
-    fn commit(&mut self, message: &str) -> Oid {
+    fn commit(&mut self, message: &str) -> ObjectId {
         self.commit_files(message, &[("tracked", message.as_bytes())])
     }
 
-    fn commit_files(&mut self, message: &str, files: &[(&str, &[u8])]) -> Oid {
-        let parent = match self.repository.head() {
-            Ok(head) => Some(head.peel_to_commit().unwrap()),
-            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => None,
-            Err(error) => panic!("{error}"),
+    // Commit `files` on top of HEAD, keeping the files earlier commits added.
+    fn commit_files(&mut self, message: &str, files: &[(&str, &[u8])]) -> ObjectId {
+        let parent = self.repository.head_commit().ok();
+        let tree = match &parent {
+            Some(commit) => commit.tree_id().unwrap().detach(),
+            None => self.repository.empty_tree().id,
         };
-        let previous = parent.as_ref().map(|commit| commit.tree().unwrap());
-        let mut tree = self.repository.treebuilder(previous.as_ref()).unwrap();
+        let mut tree = self.repository.edit_tree(tree).unwrap();
         for (name, content) in files {
             fs::write(self.repo.join(name), content).unwrap();
-            let blob = self.repository.blob(content).unwrap();
-            tree.insert(*name, blob, 0o100644).unwrap();
+            let blob = self.repository.write_blob(content).unwrap();
+            tree.upsert(*name, gix::object::tree::EntryKind::Blob, blob)
+                .unwrap();
         }
-        let tree = self.repository.find_tree(tree.write().unwrap()).unwrap();
-        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = tree.write().unwrap();
         self.repository
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                message,
-                &tree,
-                &parent.iter().collect::<Vec<_>>(),
-            )
+            .commit("HEAD", message, tree, parent.map(|commit| commit.id))
             .unwrap()
+            .detach()
     }
 
     // The fixture flake uses builtins.derivation without nixpkgs, so checks
     // build offline in milliseconds. It still needs a shell as its builder,
     // and pure flake evaluation cannot read environment variables, so the
     // host's sh path is committed as `builder` for the flake to readFile.
-    fn flake_commit(&mut self, message: &str, script: &str) -> Oid {
+    fn flake_commit(&mut self, message: &str, script: &str) -> ObjectId {
         let shell = env::split_paths(&env::var_os("PATH").unwrap())
             .map(|directory| directory.join("sh"))
             .find(|candidate| candidate.is_file())
@@ -124,11 +118,27 @@ impl Fixture {
     }
 }
 
-fn validated(output: &Output) -> Vec<Oid> {
+// Fixture commits need an author and committer, and updating branches
+// writes a reflog entry naming the committer. Set a user in memory, which
+// gix uses for both, so the tests also run where Git has no user config,
+// like the Nix build sandbox.
+fn with_test_identity(mut repository: Repository) -> Repository {
+    let mut config = repository.config_snapshot_mut();
+    config
+        .set_value(&gix::config::tree::User::NAME, "Test")
+        .unwrap();
+    config
+        .set_value(&gix::config::tree::User::EMAIL, "test@example.com")
+        .unwrap();
+    config.commit().unwrap();
+    repository
+}
+
+fn validated(output: &Output) -> Vec<ObjectId> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix("Validating "))
-        .map(|id| Oid::from_str(id).unwrap())
+        .map(|id| ObjectId::from_hex(id.as_bytes()).unwrap())
         .collect()
 }
 
@@ -142,7 +152,7 @@ fn checks_selected_commit_flakes_without_changing_the_checkout() {
     let second = fixture.commit("Second");
     // The checkout fails, but the two selected historical flakes pass.
     fixture.flake_commit("Failing tip", FAILING);
-    let head = fixture.repository.head().unwrap().target().unwrap();
+    let head = fixture.repository.head_id().unwrap().detach();
     fs::write(fixture.repo.join("flake.nix"), "uncommitted flake edit").unwrap();
     let output = fixture.run(&format!("{base}..{second}"));
     assert!(
@@ -151,7 +161,7 @@ fn checks_selected_commit_flakes_without_changing_the_checkout() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(validated(&output), [first, second]);
-    assert_eq!(fixture.repository.head().unwrap().target().unwrap(), head);
+    assert_eq!(fixture.repository.head_id().unwrap().detach(), head);
     assert_eq!(
         fs::read_to_string(fixture.repo.join("flake.nix")).unwrap(),
         "uncommitted flake edit"
@@ -186,7 +196,7 @@ fn checks_a_commit_at_a_shallow_boundary() {
     let objects = fixture.repository.path().join("objects");
     let parent = parent.to_string();
     fs::remove_file(objects.join(&parent[..2]).join(&parent[2..])).unwrap();
-    let shallow = fixture.repository.commondir().join("shallow");
+    let shallow = fixture.repository.common_dir().join("shallow");
     fs::write(&shallow, format!("{head}\n")).unwrap();
     let output = fixture.run("HEAD^!");
     assert!(
