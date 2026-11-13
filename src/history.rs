@@ -1,7 +1,11 @@
-use git2::{ErrorCode, Object, Oid, Repository, RevparseMode, Revwalk, Sort};
+use gix::revision::plumbing::Spec;
+use gix::{ObjectId, Repository};
+use std::collections::{HashMap, HashSet};
 
-use crate::{CommitId, Error};
+use crate::{CommitId, Context, Error};
 
+// Find the commits to validate: reachable from an included revision but
+// not from an excluded one, with parents before their children.
 pub(crate) fn resolve_commits(
     repo: &Repository,
     revisions: &[&str],
@@ -12,99 +16,144 @@ pub(crate) fn resolve_commits(
         && let Some(revision) = input.strip_suffix("^!")
     {
         // A single-commit selection does not need any parent history.
-        return Ok(vec![CommitId(resolve(repo, revision)?.id())]);
+        let id = repo
+            .rev_parse_single(revision)
+            .context(Error::ParseRevision)?;
+        return Ok(vec![CommitId(commit(repo, id.detach())?)]);
     }
+    let revisions = parse_revisions(repo, revisions, all)?;
+    let history = History::walk(repo, &revisions.include, &revisions.exclude)?;
+    Ok(history.parents_first().into_iter().map(CommitId).collect())
+}
 
-    let mut walk = repo.revwalk().map_err(Error::WalkHistory)?;
-    walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
-        .map_err(Error::WalkHistory)?;
+// The commits named by the arguments, split into included and excluded.
+struct Revisions {
+    include: Vec<ObjectId>,
+    exclude: Vec<ObjectId>,
+}
 
+// gix parses every revision form `git rev-list` accepts. Turn each into
+// commits to include and exclude.
+fn parse_revisions(repo: &Repository, revisions: &[&str], all: bool) -> Result<Revisions, Error> {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
     if all {
-        walk.push_glob("refs/*").map_err(Error::WalkHistory)?;
-        match repo.head() {
-            Ok(head) => {
-                let commit = head.peel_to_commit().map_err(Error::PeelToCommit)?;
-                walk.push(commit.id()).map_err(Error::WalkHistory)?;
+        let references = repo.references().context(Error::WalkHistory)?;
+        for reference in references.all().context(Error::WalkHistory)? {
+            let mut reference = reference.context(Error::WalkHistory)?;
+            // As with `git rev-list --all`, refs to non-commit objects are ignored.
+            if let Ok(commit) = reference.peel_to_commit() {
+                include.push(commit.id);
             }
-            // An empty repository has no HEAD commit to include.
-            Err(error) if error.code() == ErrorCode::UnbornBranch => {}
-            Err(error) => return Err(Error::ParseRevision(error)),
+        }
+        // An empty repository has no HEAD commit to include.
+        if !repo.head().context(Error::ReadHead)?.is_unborn() {
+            include.push(repo.head_commit().context(Error::ReadHead)?.id);
         }
     }
     for input in revisions {
-        add_revision(repo, &mut walk, input)?;
+        let spec = repo.rev_parse(*input).context(Error::ParseRevision)?;
+        match spec.detach() {
+            Spec::Include(id) => include.push(commit(repo, id)?),
+            Spec::Exclude(id) => exclude.push(commit(repo, id)?),
+            Spec::Range { from, to } => {
+                exclude.push(commit(repo, from)?);
+                include.push(commit(repo, to)?);
+            }
+            Spec::Merge { theirs, ours } => {
+                let (theirs, ours) = (commit(repo, theirs)?, commit(repo, ours)?);
+                include.extend([theirs, ours]);
+                // Unrelated histories have no common ancestors to exclude.
+                let bases = repo
+                    .merge_bases_many(theirs, &[ours])
+                    .context(Error::MergeBases)?;
+                exclude.extend(bases.into_iter().map(|id| id.detach()));
+            }
+            Spec::IncludeOnlyParents(id) => include.extend(parents(repo, commit(repo, id)?)?),
+            Spec::ExcludeParents(id) => {
+                let id = commit(repo, id)?;
+                include.push(id);
+                exclude.extend(parents(repo, id)?);
+            }
+        }
     }
-
-    walk.map(|id| id.map(CommitId).map_err(Error::WalkHistory))
-        .collect()
+    Ok(Revisions { include, exclude })
 }
 
-fn add_revision(repo: &Repository, walk: &mut Revwalk<'_>, input: &str) -> Result<(), Error> {
-    // libgit2 parses single revisions and ranges. Expand the remaining
-    // revision-set shorthands into its native push/hide operations.
-    if let Some(revision) = input.strip_prefix('^') {
-        walk.hide(resolve(repo, revision)?.id())
-            .map_err(Error::WalkHistory)?;
-    } else if let Some(revision) = input.strip_suffix("^!") {
-        let commit = resolve(repo, revision)?;
-        walk.push(commit.id()).map_err(Error::WalkHistory)?;
-        for parent in commit.parent_ids() {
-            walk.hide(parent).map_err(Error::WalkHistory)?;
+// Commits reachable from some starting points, and each commit's parents.
+struct History {
+    parents: HashMap<ObjectId, Vec<ObjectId>>,
+}
+
+impl History {
+    fn walk(repo: &Repository, from: &[ObjectId], hide: &[ObjectId]) -> Result<Self, Error> {
+        let mut parents = HashMap::new();
+        let walk = repo
+            .rev_walk(from.iter().copied())
+            .with_hidden(hide.iter().copied())
+            .all()
+            .context(Error::WalkHistory)?;
+        for info in walk {
+            let info = info.context(Error::WalkHistory)?;
+            parents.insert(info.id, info.parent_ids.to_vec());
         }
-    } else if let Some(revision) = input.strip_suffix("^@") {
-        for parent in resolve(repo, revision)?.parent_ids() {
-            walk.push(parent).map_err(Error::WalkHistory)?;
-        }
-    } else {
-        let spec = repo.revparse(input).map_err(Error::ParseRevision)?;
-        let from = peel(spec.from().expect("libgit2 supplies the range start"))?;
-        match spec.mode() {
-            mode if mode.contains(RevparseMode::SINGLE) => {
-                walk.push(from).map_err(Error::WalkHistory)?;
-            }
-            mode if mode.contains(RevparseMode::MERGE_BASE) => {
-                let to = peel(spec.to().expect("libgit2 supplies the range end"))?;
-                walk.push(from).map_err(Error::WalkHistory)?;
-                walk.push(to).map_err(Error::WalkHistory)?;
-                match repo.merge_bases(from, to) {
-                    Ok(bases) => {
-                        for base in bases.iter() {
-                            walk.hide(*base).map_err(Error::WalkHistory)?;
-                        }
+        Ok(Self { parents })
+    }
+
+    fn parents(&self, id: &ObjectId) -> impl Iterator<Item = &ObjectId> {
+        self.parents.get(id).into_iter().flatten()
+    }
+
+    // The walked commits, with every parent before its children. gix's
+    // topological walk can't be used: it loads every parent, which fails at
+    // shallow boundaries.
+    fn parents_first(&self) -> Vec<ObjectId> {
+        let mut ids: Vec<_> = self.parents.keys().copied().collect();
+        ids.sort();
+        let kept: HashSet<_> = ids.iter().copied().collect();
+        let mut order = Vec::with_capacity(ids.len());
+        let mut done = HashSet::new();
+        for id in ids {
+            let mut stack = vec![(id, false)];
+            while let Some((id, expanded)) = stack.pop() {
+                if expanded {
+                    if done.insert(id) {
+                        order.push(id);
                     }
-                    // Unrelated histories have no common ancestors to hide.
-                    Err(error) if error.code() == ErrorCode::NotFound => {}
-                    Err(error) => return Err(Error::MergeBases(error)),
+                    continue;
+                }
+                if done.contains(&id) {
+                    continue;
+                }
+                stack.push((id, true));
+                for parent in self.parents(&id) {
+                    if kept.contains(parent) && !done.contains(parent) {
+                        stack.push((*parent, false));
+                    }
                 }
             }
-            mode if mode.contains(RevparseMode::RANGE) => {
-                let to = peel(spec.to().expect("libgit2 supplies the range end"))?;
-                walk.hide(from).map_err(Error::WalkHistory)?;
-                walk.push(to).map_err(Error::WalkHistory)?;
-            }
-            mode => return Err(Error::UnsupportedRevisionMode(mode)),
         }
+        order
     }
-    Ok(())
 }
 
-fn resolve<'repo>(repo: &'repo Repository, revision: &str) -> Result<git2::Commit<'repo>, Error> {
-    repo.revparse_single(revision)
-        .map_err(Error::ParseRevision)?
-        .peel_to_commit()
-        .map_err(Error::PeelToCommit)
+// Peel an object to its commit, following tags if necessary.
+fn commit(repo: &Repository, id: ObjectId) -> Result<ObjectId, Error> {
+    let object = repo.find_object(id).context(Error::PeelToCommit)?;
+    Ok(object.peel_to_commit().context(Error::PeelToCommit)?.id)
 }
 
-fn peel(object: &Object<'_>) -> Result<Oid, Error> {
-    object
-        .peel_to_commit()
-        .map(|commit| commit.id())
-        .map_err(Error::PeelToCommit)
+fn parents(repo: &Repository, id: ObjectId) -> Result<Vec<ObjectId>, Error> {
+    let commit = repo.find_commit(id).context(Error::FindCommit)?;
+    Ok(commit.parent_ids().map(|id| id.detach()).collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Oid, Repository, resolve_commits};
+    use super::resolve_commits;
+    // Fixtures still use git2 here, so these tests are exactly the ones the
+    // git2 version passes.
+    use git2::{Oid, Repository};
     use tempfile::TempDir;
 
     struct History {
@@ -163,8 +212,13 @@ mod tests {
     }
 
     fn select(fixture: &History, revisions: &[&str], all: bool) -> Result<Vec<Oid>, crate::Error> {
-        resolve_commits(&fixture.repository, revisions, all)
-            .map(|commits| commits.into_iter().map(|commit| commit.0).collect())
+        let repo = gix::open(fixture.repository.path()).unwrap();
+        resolve_commits(&repo, revisions, all).map(|commits| {
+            commits
+                .into_iter()
+                .map(|commit| Oid::from_bytes(commit.0.as_bytes()).unwrap())
+                .collect()
+        })
     }
 
     fn assert_selection(mut actual: Vec<Oid>, expected: &[Oid]) {
