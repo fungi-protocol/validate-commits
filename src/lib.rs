@@ -1,4 +1,5 @@
 mod history;
+mod mutants;
 mod nix;
 mod shallow;
 #[cfg(test)]
@@ -96,6 +97,22 @@ pub enum Error {
     MissingFetchedCommit(gix::ObjectId),
     #[error("fetch did not deepen history; origin may itself be shallow")]
     NoHistoryProgress,
+    #[error("could not prepare the mutation diff for commit {commit}: {source}")]
+    MutationDiff { commit: CommitId, source: Source },
+    #[error("could not parse flake.lock for commit {commit}: {source}")]
+    ParseLock {
+        commit: CommitId,
+        source: serde_json::Error,
+    },
+    #[error("could not write the mutation diff: {0}")]
+    WriteMutationDiff(#[source] std::io::Error),
+    #[error("could not add the mutation diff for commit {commit} to the Nix store: {status}")]
+    ImportMutationDiff {
+        commit: CommitId,
+        status: ExitStatus,
+    },
+    #[error("Nix returned an invalid store path for the mutation diff")]
+    InvalidDiffStorePath,
     #[error("could not write output: {0}")]
     WriteOutput(#[source] std::io::Error),
     #[error("could not start Nix while checking commit {commit}: {source}")]
