@@ -20,6 +20,8 @@
         nativeCheckInputs = [
           pkgs.nix
           pkgs.git
+          # The mutation test runs `cargo mutants --list` through real Nix.
+          pkgs.cargo-mutants
         ];
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;

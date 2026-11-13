@@ -58,6 +58,22 @@ pub(crate) fn commit_as(
     id
 }
 
+// A tree with `files` written on top of `tree`.
+pub(crate) fn tree_with(
+    repository: &Repository,
+    tree: ObjectId,
+    files: &[(&str, &[u8])],
+) -> ObjectId {
+    let mut editor = repository.edit_tree(tree).unwrap();
+    for (path, content) in files {
+        let blob = repository.write_blob(content).unwrap();
+        editor
+            .upsert(*path, gix::object::tree::EntryKind::Blob, blob)
+            .unwrap();
+    }
+    editor.write().unwrap().detach()
+}
+
 // History built in a "remote" repository, then cloned with only a few
 // commits, the way CI checks out a pull request.
 pub(crate) struct Remote {

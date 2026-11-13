@@ -8,8 +8,7 @@ repository = "https://github.com/fungi-protocol/validate-commits"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-gix = { version = "0.90", default-features = false, features = ["revision", "sha1"] }
-thiserror = "2"
-
-[dev-dependencies]
+gix = { version = "0.90", default-features = false, features = ["blob-diff", "revision", "sha1"] }
+serde_json = "1"
 tempfile = "3.23.0"
+thiserror = "2"

@@ -11,6 +11,11 @@ use tempfile::TempDir;
 const FLAKE: &[u8] = include_bytes!("flakes/flake.nix");
 const PASSING: &str = r#"printf passed > "$out""#;
 const FAILING: &str = "echo fixture-check-failed >&2; exit 1";
+// A flake whose mutation check runs `cargo mutants --list` on its input.
+const MUTANTS_FLAKE: &[u8] = include_bytes!("flakes/mutants/flake.nix");
+const MUTANTS_SCRIPT: &[u8] = include_bytes!("flakes/mutants/mutants.sh");
+const CRATE_MANIFEST: &[u8] =
+    b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 
 struct Fixture {
     root: TempDir,
@@ -54,7 +59,9 @@ impl Fixture {
         };
         let mut tree = self.repository.edit_tree(tree).unwrap();
         for (name, content) in files {
-            fs::write(self.repo.join(name), content).unwrap();
+            let path = self.repo.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
             let blob = self.repository.write_blob(content).unwrap();
             tree.upsert(*name, gix::object::tree::EntryKind::Blob, blob)
                 .unwrap();
@@ -71,17 +78,11 @@ impl Fixture {
     // and pure flake evaluation cannot read environment variables, so the
     // host's sh path is committed as `builder` for the flake to readFile.
     fn flake_commit(&mut self, message: &str, script: &str) -> ObjectId {
-        let shell = env::split_paths(&env::var_os("PATH").unwrap())
-            .map(|directory| directory.join("sh"))
-            .find(|candidate| candidate.is_file())
-            .expect("sh must be available while running tests")
-            .canonicalize()
-            .unwrap();
         self.commit_files(
             message,
             &[
                 ("flake.nix", FLAKE),
-                ("builder", shell.to_str().unwrap().as_bytes()),
+                ("builder", host_shell().as_bytes()),
                 ("script", script.as_bytes()),
             ],
         )
@@ -92,9 +93,41 @@ impl Fixture {
     }
 
     fn run_args(&self, revisions: &[&str]) -> Output {
+        self.with_private_nix(Command::new(env!("CARGO_BIN_EXE_validate-commits")))
+            .args(revisions)
+            // Include CLI subprocesses in the coverage collector's output.
+            .envs(env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path)))
+            .output()
+            .unwrap()
+    }
+
+    // Lock the flake at HEAD and commit its flake.lock. The fixtures commit
+    // without updating Git's index, so lock the commit, not the checkout.
+    fn lock(&mut self) -> ObjectId {
+        let head = self.repository.head_id().unwrap();
+        let lock = self.root.path().join("flake.lock");
+        let output = self
+            .with_private_nix(Command::new("nix"))
+            .args(["flake", "lock", "--output-lock-file"])
+            .arg(&lock)
+            .arg(format!("git+file:.?rev={head}"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.commit_files(
+            "Lock the flake",
+            &[("flake.lock", &fs::read(lock).unwrap())],
+        )
+    }
+
+    // Build tiny dependency-free checks in a private single-user store.
+    // No daemon, downloads, privileged sandbox, or user store is needed.
+    fn with_private_nix(&self, mut command: Command) -> Command {
         let root = self.root.path().display();
-        // Build tiny dependency-free checks in a private single-user store.
-        // No daemon, downloads, privileged sandbox, or user store is needed.
         let config = format!(
             "store = local?store={root}/store&state={root}/state&log={root}/log\n\
              sandbox = false\n\
@@ -103,19 +136,45 @@ impl Fixture {
              flake-registry =\n\
              experimental-features = nix-command flakes\n"
         );
-        Command::new(env!("CARGO_BIN_EXE_validate-commits"))
-            .args(revisions)
+        command
             .current_dir(&self.repo)
             .env_clear()
             .env("PATH", env::var_os("PATH").unwrap())
             .env("NIX_CONFIG", config)
             .env("NIX_USER_CONF_FILES", "")
-            .env("XDG_CACHE_HOME", self.root.path().join("cache"))
-            // Include CLI subprocesses in the coverage collector's output.
-            .envs(env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path)))
-            .output()
-            .unwrap()
+            .env("XDG_CACHE_HOME", self.root.path().join("cache"));
+        command
     }
+}
+
+fn host_shell() -> String {
+    let shell = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("sh"))
+        .find(|candidate| candidate.is_file())
+        .expect("sh must be available while running tests")
+        .canonicalize()
+        .unwrap();
+    shell.to_str().unwrap().to_owned()
+}
+
+// Shell lines that let a fixture derivation run the host's cargo and
+// cargo-mutants, the same way the fixtures run the host's sh. rustup's
+// cargo also needs to find its toolchains.
+fn host_tools() -> String {
+    let mut tools = format!("export PATH='{}'\n", env::var("PATH").unwrap());
+    for name in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+        if let Ok(value) = env::var(name) {
+            tools.push_str(&format!("export {name}='{value}'\n"));
+        }
+    }
+    tools
+}
+
+fn crate_source(changed: i32) -> Vec<u8> {
+    format!(
+        "pub fn changed() -> i32 {{\n    {changed}\n}}\n\npub fn untouched() -> i32 {{\n    2\n}}\n"
+    )
+    .into_bytes()
 }
 
 fn git(directory: &std::path::Path, args: &[&str]) {
@@ -232,4 +291,47 @@ fn checks_commits_in_a_shallow_clone() {
     );
     assert_eq!(validated(&output), [head]);
     assert!(fixture.repository.is_shallow().unwrap());
+}
+
+#[test]
+fn passes_each_commits_rust_diff_to_cargo_mutants() {
+    // A crate with two functions, then a commit that changes one and adds a
+    // module. The fixture flake runs `cargo mutants --list` on the diff the
+    // tool passes in, and fails unless every mutant comes from the changed
+    // function or the new module.
+    Command::new("cargo-mutants")
+        .arg("--version")
+        .output()
+        .expect("cargo-mutants must be on PATH to run the mutation test");
+    let mut fixture = Fixture::new();
+    fixture.commit_files(
+        "Crate with a mutation check",
+        &[
+            ("flake.nix", MUTANTS_FLAKE),
+            ("mutants.sh", MUTANTS_SCRIPT),
+            ("builder", host_shell().as_bytes()),
+            ("tools", host_tools().as_bytes()),
+            ("mutants-diff/full-suite", b""),
+            ("Cargo.toml", CRATE_MANIFEST),
+            ("src/lib.rs", &crate_source(1)),
+        ],
+    );
+    let base = fixture.lock();
+    let lib = [b"pub mod added;\n".as_slice(), &crate_source(10)].concat();
+    let head = fixture.commit_files(
+        "Change one function and add a module",
+        &[
+            ("src/lib.rs", &lib),
+            ("src/added.rs", b"pub fn added() -> i32 {\n    3\n}\n"),
+        ],
+    );
+
+    let output = fixture.run(&format!("{base}..HEAD"));
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{log}");
+    assert_eq!(validated(&output), [head]);
+    // Nix prints the check's log, so cargo-mutants really listed mutants,
+    // including ones in the new file.
+    assert!(log.contains("replace changed"), "{log}");
+    assert!(log.contains("replace added"), "{log}");
 }
