@@ -151,22 +151,24 @@ fn parents(repo: &Repository, id: ObjectId) -> Result<Vec<ObjectId>, Error> {
 #[cfg(test)]
 mod tests {
     use super::resolve_commits;
-    // Fixtures still use git2 here, so these tests are exactly the ones the
-    // git2 version passes.
-    use git2::{Oid, Repository};
+    use crate::Error;
+    use crate::test_support::{commit_as, with_test_identity};
+    use gix::refs::Target;
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+    use gix::{ObjectId, Repository};
     use tempfile::TempDir;
 
     struct History {
         _root: TempDir,
         repository: Repository,
-        commits: Vec<Oid>,
+        commits: Vec<ObjectId>,
     }
 
     impl History {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let repository = Repository::init(root.path()).unwrap();
-            let tree = repository.treebuilder(None).unwrap().write().unwrap();
+            let repository = with_test_identity(gix::init(root.path()).unwrap());
+            let tree = repository.empty_tree().id;
             let mut commits = Vec::new();
             for (timestamp, message) in ["Base", "First", "Second", "Third"].into_iter().enumerate()
             {
@@ -187,41 +189,12 @@ mod tests {
         }
     }
 
-    fn signature(timestamp: i64) -> git2::Signature<'static> {
-        git2::Signature::new("Test", "test@example.com", &git2::Time::new(timestamp, 0)).unwrap()
+    fn select(fixture: &History, revisions: &[&str], all: bool) -> Result<Vec<ObjectId>, Error> {
+        resolve_commits(&fixture.repository, revisions, all)
+            .map(|commits| commits.into_iter().map(|commit| commit.0).collect())
     }
 
-    fn commit_as(
-        repository: &Repository,
-        reference: Option<&str>,
-        message: &str,
-        tree: Oid,
-        parents: impl IntoIterator<Item = Oid>,
-        timestamp: i64,
-    ) -> Oid {
-        let signature = signature(timestamp);
-        let tree = repository.find_tree(tree).unwrap();
-        let parents: Vec<_> = parents
-            .into_iter()
-            .map(|id| repository.find_commit(id).unwrap())
-            .collect();
-        let parents: Vec<_> = parents.iter().collect();
-        repository
-            .commit(reference, &signature, &signature, message, &tree, &parents)
-            .unwrap()
-    }
-
-    fn select(fixture: &History, revisions: &[&str], all: bool) -> Result<Vec<Oid>, crate::Error> {
-        let repo = gix::open(fixture.repository.path()).unwrap();
-        resolve_commits(&repo, revisions, all).map(|commits| {
-            commits
-                .into_iter()
-                .map(|commit| Oid::from_bytes(commit.0.as_bytes()).unwrap())
-                .collect()
-        })
-    }
-
-    fn assert_selection(mut actual: Vec<Oid>, expected: &[Oid]) {
+    fn assert_selection(mut actual: Vec<ObjectId>, expected: &[ObjectId]) {
         actual.sort();
         let mut expected = expected.to_vec();
         expected.sort();
@@ -232,8 +205,14 @@ mod tests {
     fn orders_merge_parents_with_skewed_dates() {
         let fixture = History::new();
         let base = fixture.commits[3];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
-        let commit = |message, parents: &[Oid], timestamp| {
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
+        let commit = |message, parents: &[ObjectId], timestamp| {
             commit_as(
                 &fixture.repository,
                 None,
@@ -264,15 +243,21 @@ mod tests {
         // together.
         let fixture = History::new();
         let base = fixture.commits[0];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
         let side = commit_as(&fixture.repository, None, "Side", tree, [base], 100);
         fixture
             .repository
-            .reference("refs/heads/side", side, false, "test")
+            .reference("refs/heads/side", side, PreviousValue::Any, "test")
             .unwrap();
         fixture
             .repository
-            .reference("refs/heads/base", base, false, "test")
+            .reference("refs/heads/base", base, PreviousValue::Any, "test")
             .unwrap();
         let cases = [
             // "^base" leaves out Base and everything before it.
@@ -313,25 +298,43 @@ mod tests {
         // it can only be found through HEAD.
         let fixture = History::new();
         let base = fixture.commits[0];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
         let side = commit_as(&fixture.repository, None, "Side", tree, [base], 100);
         fixture
             .repository
-            .reference("refs/heads/side", side, false, "test")
+            .reference("refs/heads/side", side, PreviousValue::Any, "test")
             .unwrap();
         let tagged = commit_as(&fixture.repository, None, "Tagged", tree, [base], 200);
         fixture
             .repository
             .tag(
                 "release",
-                &fixture.repository.find_object(tagged, None).unwrap(),
-                &signature(200),
+                tagged,
+                gix::objs::Kind::Commit,
+                None,
                 "Release",
-                false,
+                PreviousValue::MustNotExist,
             )
             .unwrap();
         let detached = commit_as(&fixture.repository, None, "Detached", tree, [base], 300);
-        fixture.repository.set_head_detached(detached).unwrap();
+        fixture
+            .repository
+            .edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange::default(),
+                    expected: PreviousValue::Any,
+                    new: Target::Object(detached),
+                },
+                name: "HEAD".try_into().unwrap(),
+                deref: false,
+            })
+            .unwrap();
         let mut expected = fixture.commits.clone();
         expected.extend([side, tagged, detached]);
         let commits = select(&fixture, &[], true).unwrap();
@@ -345,14 +348,24 @@ mod tests {
         // ancestors. Both must be left out, leaving only Left and Right.
         let fixture = History::new();
         let base = fixture.commits[0];
-        let tree = fixture.repository.find_commit(base).unwrap().tree_id();
+        let tree = fixture
+            .repository
+            .find_commit(base)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
         let a = commit_as(&fixture.repository, None, "A", tree, [base], 100);
         let b = commit_as(&fixture.repository, None, "B", tree, [base], 900);
         let left = commit_as(&fixture.repository, None, "Left", tree, [a, b], 10);
         let right = commit_as(&fixture.repository, None, "Right", tree, [b, a], 20);
         // Make sure the setup really has two shared ancestors.
         assert_eq!(
-            fixture.repository.merge_bases(left, right).unwrap().len(),
+            fixture
+                .repository
+                .merge_bases_many(left, &[right])
+                .unwrap()
+                .len(),
             2
         );
         let commits = select(&fixture, &[&format!("{left}...{right}")], false).unwrap();

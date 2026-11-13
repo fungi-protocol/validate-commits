@@ -1,5 +1,7 @@
 mod history;
 mod nix;
+#[cfg(test)]
+mod test_support;
 
 use std::fmt;
 use std::io::Write;
