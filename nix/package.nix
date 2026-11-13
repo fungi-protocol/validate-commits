@@ -8,10 +8,16 @@
     }:
     let
       commonArgs = {
-        src = craneLib.cleanCargoSource ../.;
+        src = pkgs.lib.cleanSourceWith {
+          src = pkgs.lib.cleanSource ../.;
+          filter =
+            path: type:
+            craneLib.filterCargoSources path type || pkgs.lib.hasPrefix "${toString ../.}/tests/flakes/" path;
+        };
         strictDeps = true;
         nativeBuildInputs = [ pkgs.pkg-config ];
         buildInputs = [ pkgs.zlib ];
+        nativeCheckInputs = [ pkgs.nix ];
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
       validate-commits = craneLib.buildPackage (
