@@ -118,6 +118,19 @@ impl Fixture {
     }
 }
 
+fn git(directory: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .expect("git must be on PATH to run the shallow clone test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Fixture commits need an author and committer, and updating branches
 // writes a reflog entry naming the committer. Set a user in memory, which
 // gix uses for both, so the tests also run where Git has no user config,
@@ -175,7 +188,7 @@ fn stops_when_a_selected_commits_check_fails() {
     let passing = fixture.commit("Passing commit");
     let failing = fixture.flake_commit("Failing commit", FAILING);
     fixture.flake_commit("Passing tip", PASSING);
-    let output = fixture.run_args(&["--all", &format!("^{base}")]);
+    let output = fixture.run(&format!("{base}..HEAD"));
     assert!(!output.status.success());
     assert_eq!(validated(&output), [passing, failing]);
     let error = String::from_utf8_lossy(&output.stderr);
@@ -187,22 +200,36 @@ fn stops_when_a_selected_commits_check_fails() {
 }
 
 #[test]
-fn checks_a_commit_at_a_shallow_boundary() {
-    // Mimic a depth-1 clone: HEAD is a shallow boundary whose parent
-    // object is missing from the repository.
+fn checks_commits_in_a_shallow_clone() {
+    // Like a CI checkout: clone only the newest commit, then validate a
+    // range whose base is not in the clone. The tool must fetch enough
+    // history, and must tell Nix the clone is shallow or Nix refuses it.
     let mut fixture = Fixture::new();
-    let parent = fixture.flake_commit("Parent", PASSING);
+    fixture.flake_commit("Flake", PASSING);
+    for i in 0..10 {
+        fixture.commit(&format!("Old {i}"));
+    }
+    let base = fixture.commit("Base");
     let head = fixture.commit("Head");
-    let objects = fixture.repository.path().join("objects");
-    let parent = parent.to_string();
-    fs::remove_file(objects.join(&parent[..2]).join(&parent[2..])).unwrap();
-    let shallow = fixture.repository.common_dir().join("shallow");
-    fs::write(&shallow, format!("{head}\n")).unwrap();
-    let output = fixture.run("HEAD^!");
+    // Let the clone fetch any commit by its ID, as GitHub allows.
+    git(
+        &fixture.repo,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    let url = format!("file://{}", fixture.repo.display());
+    git(
+        fixture.root.path(),
+        &["clone", "--quiet", "--depth=1", &url, "clone"],
+    );
+    fixture.repo = fixture.root.path().join("clone");
+    fixture.repository = gix::open(&fixture.repo).unwrap();
+
+    let output = fixture.run(&format!("{base}..HEAD"));
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(validated(&output), [head]);
+    assert!(fixture.repository.is_shallow().unwrap());
 }
