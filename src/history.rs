@@ -9,19 +9,8 @@ use crate::{CommitId, Context, Error};
 pub(crate) fn resolve_commits(
     repo: &Repository,
     revisions: &[&str],
-    all: bool,
 ) -> Result<Vec<CommitId>, Error> {
-    if !all
-        && let [input] = revisions
-        && let Some(revision) = input.strip_suffix("^!")
-    {
-        // A single-commit selection does not need any parent history.
-        let id = repo
-            .rev_parse_single(revision)
-            .context(Error::ParseRevision)?;
-        return Ok(vec![CommitId(commit(repo, id.detach())?)]);
-    }
-    let revisions = parse_revisions(repo, revisions, all)?;
+    let revisions = parse_revisions(repo, revisions)?;
     let history = History::walk(repo, &revisions.include, &revisions.exclude)?;
     Ok(history.parents_first().into_iter().map(CommitId).collect())
 }
@@ -32,25 +21,12 @@ struct Revisions {
     exclude: Vec<ObjectId>,
 }
 
-// gix parses every revision form `git rev-list` accepts. Turn each into
-// commits to include and exclude.
-fn parse_revisions(repo: &Repository, revisions: &[&str], all: bool) -> Result<Revisions, Error> {
+// Accept only X, ^X and A..B. Other forms (X^!, X^@, A...B) need parents
+// or common ancestors, which a shallow clone may not have downloaded.
+// Rejecting them everywhere keeps full and shallow clones consistent.
+fn parse_revisions(repo: &Repository, revisions: &[&str]) -> Result<Revisions, Error> {
     let mut include = Vec::new();
     let mut exclude = Vec::new();
-    if all {
-        let references = repo.references().context(Error::WalkHistory)?;
-        for reference in references.all().context(Error::WalkHistory)? {
-            let mut reference = reference.context(Error::WalkHistory)?;
-            // As with `git rev-list --all`, refs to non-commit objects are ignored.
-            if let Ok(commit) = reference.peel_to_commit() {
-                include.push(commit.id);
-            }
-        }
-        // An empty repository has no HEAD commit to include.
-        if !repo.head().context(Error::ReadHead)?.is_unborn() {
-            include.push(repo.head_commit().context(Error::ReadHead)?.id);
-        }
-    }
     for input in revisions {
         let spec = repo.rev_parse(*input).context(Error::ParseRevision)?;
         match spec.detach() {
@@ -60,21 +36,7 @@ fn parse_revisions(repo: &Repository, revisions: &[&str], all: bool) -> Result<R
                 exclude.push(commit(repo, from)?);
                 include.push(commit(repo, to)?);
             }
-            Spec::Merge { theirs, ours } => {
-                let (theirs, ours) = (commit(repo, theirs)?, commit(repo, ours)?);
-                include.extend([theirs, ours]);
-                // Unrelated histories have no common ancestors to exclude.
-                let bases = repo
-                    .merge_bases_many(theirs, &[ours])
-                    .context(Error::MergeBases)?;
-                exclude.extend(bases.into_iter().map(|id| id.detach()));
-            }
-            Spec::IncludeOnlyParents(id) => include.extend(parents(repo, commit(repo, id)?)?),
-            Spec::ExcludeParents(id) => {
-                let id = commit(repo, id)?;
-                include.push(id);
-                exclude.extend(parents(repo, id)?);
-            }
+            _ => return Err(Error::UnsupportedRevision),
         }
     }
     Ok(Revisions { include, exclude })
@@ -143,18 +105,12 @@ fn commit(repo: &Repository, id: ObjectId) -> Result<ObjectId, Error> {
     Ok(object.peel_to_commit().context(Error::PeelToCommit)?.id)
 }
 
-fn parents(repo: &Repository, id: ObjectId) -> Result<Vec<ObjectId>, Error> {
-    let commit = repo.find_commit(id).context(Error::FindCommit)?;
-    Ok(commit.parent_ids().map(|id| id.detach()).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::resolve_commits;
     use crate::Error;
     use crate::test_support::{commit_as, with_test_identity};
-    use gix::refs::Target;
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+    use gix::refs::transaction::PreviousValue;
     use gix::{ObjectId, Repository};
     use tempfile::TempDir;
 
@@ -189,8 +145,12 @@ mod tests {
         }
     }
 
-    fn select(fixture: &History, revisions: &[&str], all: bool) -> Result<Vec<ObjectId>, Error> {
-        resolve_commits(&fixture.repository, revisions, all)
+    fn select(fixture: &History, revisions: &[&str]) -> Result<Vec<ObjectId>, Error> {
+        select_in(&fixture.repository, revisions)
+    }
+
+    fn select_in(repository: &Repository, revisions: &[&str]) -> Result<Vec<ObjectId>, Error> {
+        resolve_commits(repository, revisions)
             .map(|commits| commits.into_iter().map(|commit| commit.0).collect())
     }
 
@@ -231,7 +191,7 @@ mod tests {
         let b = commit("B", &[a], 100);
         let head = commit("Merge", &[b, fork], 100);
 
-        let commits = select(&fixture, &[&format!("{base}..{head}")], false).unwrap();
+        let commits = select(&fixture, &[&format!("{base}..{head}")]).unwrap();
         assert_eq!(commits, vec![fork, left, a, b, head]);
     }
 
@@ -280,103 +240,25 @@ mod tests {
                     side,
                 ],
             ),
-            // "X^@" means "X's parents and their history", without X itself.
-            (vec!["HEAD^@", "^base"], fixture.commits[1..3].to_vec()),
-            // "X^!" means "only commit X".
-            (vec!["HEAD^!", "side^!"], vec![fixture.commits[3], side]),
         ];
         for (args, expected) in cases {
-            let commits = select(&fixture, &args, false).unwrap();
+            let commits = select(&fixture, &args).unwrap();
             assert_selection(commits, &expected);
         }
     }
 
     #[test]
-    fn all_includes_branches_tags_and_detached_head() {
-        // --all must select every commit reachable from a branch, a tag, or
-        // HEAD. HEAD is detached here, so no branch points to "Detached";
-        // it can only be found through HEAD.
+    fn rejects_revisions_that_need_parents_or_common_ancestors() {
+        // "X^!", "X^@" and "A...B" depend on parents or common ancestors,
+        // which a shallow clone may not have. They are rejected in every
+        // clone so a command behaves the same in CI and locally.
         let fixture = History::new();
-        let base = fixture.commits[0];
-        let tree = fixture
-            .repository
-            .find_commit(base)
-            .unwrap()
-            .tree_id()
-            .unwrap()
-            .detach();
-        let side = commit_as(&fixture.repository, None, "Side", tree, [base], 100);
-        fixture
-            .repository
-            .reference("refs/heads/side", side, PreviousValue::Any, "test")
-            .unwrap();
-        let tagged = commit_as(&fixture.repository, None, "Tagged", tree, [base], 200);
-        fixture
-            .repository
-            .tag(
-                "release",
-                tagged,
-                gix::objs::Kind::Commit,
-                None,
-                "Release",
-                PreviousValue::MustNotExist,
-            )
-            .unwrap();
-        let detached = commit_as(&fixture.repository, None, "Detached", tree, [base], 300);
-        fixture
-            .repository
-            .edit_reference(RefEdit {
-                change: Change::Update {
-                    log: LogChange::default(),
-                    expected: PreviousValue::Any,
-                    new: Target::Object(detached),
-                },
-                name: "HEAD".try_into().unwrap(),
-                deref: false,
-            })
-            .unwrap();
-        let mut expected = fixture.commits.clone();
-        expected.extend([side, tagged, detached]);
-        let commits = select(&fixture, &[], true).unwrap();
-        assert_selection(commits, &expected);
-    }
-
-    #[test]
-    fn symmetric_ranges_hide_all_merge_bases_and_allow_unrelated_histories() {
-        // "left...right" means "commits on either side, but not on both".
-        // Left and Right are both merges of A and B, so they share two
-        // ancestors. Both must be left out, leaving only Left and Right.
-        let fixture = History::new();
-        let base = fixture.commits[0];
-        let tree = fixture
-            .repository
-            .find_commit(base)
-            .unwrap()
-            .tree_id()
-            .unwrap()
-            .detach();
-        let a = commit_as(&fixture.repository, None, "A", tree, [base], 100);
-        let b = commit_as(&fixture.repository, None, "B", tree, [base], 900);
-        let left = commit_as(&fixture.repository, None, "Left", tree, [a, b], 10);
-        let right = commit_as(&fixture.repository, None, "Right", tree, [b, a], 20);
-        // Make sure the setup really has two shared ancestors.
-        assert_eq!(
-            fixture
-                .repository
-                .merge_bases_many(left, &[right])
-                .unwrap()
-                .len(),
-            2
-        );
-        let commits = select(&fixture, &[&format!("{left}...{right}")], false).unwrap();
-        assert_selection(commits, &[left, right]);
-
-        // Unrelated shares no history with HEAD. Instead of failing, the
-        // range should select every commit from both sides.
-        let unrelated = commit_as(&fixture.repository, None, "Unrelated", tree, [], 5);
-        let commits = select(&fixture, &[&format!("HEAD...{unrelated}")], false).unwrap();
-        let mut expected = fixture.commits.clone();
-        expected.push(unrelated);
-        assert_selection(commits, &expected);
+        for revision in ["HEAD^!", "HEAD^@", "HEAD~2...HEAD"] {
+            let result = select(&fixture, &[revision]);
+            assert!(
+                matches!(result, Err(Error::UnsupportedRevision)),
+                "{revision}: {result:?}"
+            );
+        }
     }
 }

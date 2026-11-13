@@ -175,7 +175,7 @@ fn stops_when_a_selected_commits_check_fails() {
     let passing = fixture.commit("Passing commit");
     let failing = fixture.flake_commit("Failing commit", FAILING);
     fixture.flake_commit("Passing tip", PASSING);
-    let output = fixture.run_args(&["--all", &format!("^{base}")]);
+    let output = fixture.run(&format!("{base}..HEAD"));
     assert!(!output.status.success());
     assert_eq!(validated(&output), [passing, failing]);
     let error = String::from_utf8_lossy(&output.stderr);
@@ -188,17 +188,15 @@ fn stops_when_a_selected_commits_check_fails() {
 
 #[test]
 fn checks_a_commit_at_a_shallow_boundary() {
-    // Mimic a depth-1 clone: HEAD is a shallow boundary whose parent
-    // object is missing from the repository.
+    // HEAD is a shallow boundary, like the tip of a depth-1 clone. Nix
+    // refuses a shallow repository unless the tool tells it the clone is
+    // shallow.
     let mut fixture = Fixture::new();
     let parent = fixture.flake_commit("Parent", PASSING);
     let head = fixture.commit("Head");
-    let objects = fixture.repository.path().join("objects");
-    let parent = parent.to_string();
-    fs::remove_file(objects.join(&parent[..2]).join(&parent[2..])).unwrap();
     let shallow = fixture.repository.common_dir().join("shallow");
     fs::write(&shallow, format!("{head}\n")).unwrap();
-    let output = fixture.run("HEAD^!");
+    let output = fixture.run(&format!("{parent}..HEAD"));
     assert!(
         output.status.success(),
         "{}",
