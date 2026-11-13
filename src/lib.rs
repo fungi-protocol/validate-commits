@@ -96,16 +96,9 @@ pub enum Error {
         commit: CommitId,
         source: std::io::Error,
     },
-    #[error("flake checks failed for commit {commit}{}", status_suffix(.status))]
+    #[error("flake checks failed for commit {commit}: {status}")]
     ValidationFailed {
         commit: CommitId,
         status: ExitStatus,
     },
-}
-
-fn status_suffix(status: &ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!(" with exit status {code}"),
-        None => " after termination by signal".to_owned(),
-    }
 }
