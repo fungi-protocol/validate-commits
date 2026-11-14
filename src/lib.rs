@@ -1,5 +1,8 @@
 mod history;
 mod nix;
+mod shallow;
+#[cfg(test)]
+mod test_support;
 
 use std::fmt;
 use std::io::Write;
@@ -7,8 +10,8 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 pub fn run_revisions(revisions: &[&str], output: &mut impl Write) -> Result<(), Error> {
-    let repository = discover_repository()?;
-    let commits = history::resolve_commits(&repository.git_repo, revisions)?;
+    let mut repository = discover_repository()?;
+    let commits = history::resolve_commits(&mut repository.git_repo, revisions, output)?;
 
     if commits.is_empty() {
         writeln!(output, "No commits in range.").map_err(Error::WriteOutput)?;
@@ -66,6 +69,20 @@ pub enum Error {
     PeelToCommit(#[source] git2::Error),
     #[error("could not walk the selected history: {0}")]
     WalkHistory(#[source] git2::Error),
+    #[error("could not read shallow history: {0}")]
+    ReadShallow(#[source] std::io::Error),
+    #[error("could not read a commit: {0}")]
+    FindCommit(#[source] git2::Error),
+    #[error("could not run git fetch: {0}")]
+    SpawnGit(#[source] std::io::Error),
+    #[error("git fetch failed{}", status_suffix(.status))]
+    FetchFailed { status: ExitStatus },
+    #[error("could not reopen the repository after fetching: {0}")]
+    ReopenRepository(#[source] git2::Error),
+    #[error("fetch did not supply requested commit {0}")]
+    MissingFetchedCommit(git2::Oid),
+    #[error("fetch did not deepen history; origin may itself be shallow")]
+    NoHistoryProgress,
     #[error("could not write output: {0}")]
     WriteOutput(#[source] std::io::Error),
     #[error("could not start Nix while checking commit {commit}: {source}")]
