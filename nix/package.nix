@@ -17,7 +17,10 @@
         strictDeps = true;
         nativeBuildInputs = [ pkgs.pkg-config ];
         buildInputs = [ pkgs.zlib ];
-        nativeCheckInputs = [ pkgs.nix ];
+        nativeCheckInputs = [
+          pkgs.nix
+          pkgs.git
+        ];
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
       validate-commits = craneLib.buildPackage (
@@ -27,7 +30,12 @@
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postInstall = ''
             wrapProgram "$out/bin/validate-commits" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix ]}
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.nix
+                  pkgs.git
+                ]
+              }
           '';
         }
       );
