@@ -1,6 +1,7 @@
 // Repositories for tests, built with git2.
 
-use git2::{Oid, Repository, Signature, Time};
+use git2::build::TreeUpdateBuilder;
+use git2::{FileMode, Oid, Repository, Signature, Time};
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -24,6 +25,21 @@ pub(crate) fn commit_as(
     let parents: Vec<_> = parents.iter().collect();
     repository
         .commit(reference, &signature, &signature, message, &tree, &parents)
+        .unwrap()
+}
+
+pub(crate) fn empty_tree(repository: &Repository) -> Oid {
+    repository.treebuilder(None).unwrap().write().unwrap()
+}
+
+// A tree with `files` written on top of `tree`.
+pub(crate) fn tree_with(repository: &Repository, tree: Oid, files: &[(&str, &[u8])]) -> Oid {
+    let mut update = TreeUpdateBuilder::new();
+    for (path, content) in files {
+        update.upsert(*path, repository.blob(content).unwrap(), FileMode::Blob);
+    }
+    update
+        .create_updated(repository, &repository.find_tree(tree).unwrap())
         .unwrap()
 }
 
