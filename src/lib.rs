@@ -6,9 +6,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
-pub fn run_revisions(revisions: &[&str], all: bool, output: &mut impl Write) -> Result<(), Error> {
+pub fn run_revisions(revisions: &[&str], output: &mut impl Write) -> Result<(), Error> {
     let repository = discover_repository()?;
-    let commits = history::resolve_commits(&repository.git_repo, revisions, all)?;
+    let commits = history::resolve_commits(&repository.git_repo, revisions)?;
 
     if commits.is_empty() {
         writeln!(output, "No commits in range.").map_err(Error::WriteOutput)?;
@@ -58,14 +58,12 @@ pub enum Error {
     CanonicalizeRepository(#[source] std::io::Error),
     #[error("could not parse the revision: {0}")]
     ParseRevision(#[source] git2::Error),
-    #[error("unsupported revision mode: {0:?}")]
-    UnsupportedRevisionMode(git2::RevparseMode),
+    #[error("only X and A..B revisions are supported")]
+    UnsupportedRevision,
     #[error("could not resolve a selected commit: {0}")]
     PeelToCommit(#[source] git2::Error),
     #[error("could not walk the selected history: {0}")]
     WalkHistory(#[source] git2::Error),
-    #[error("could not find common ancestors: {0}")]
-    MergeBases(#[source] git2::Error),
     #[error("could not write output: {0}")]
     WriteOutput(#[source] std::io::Error),
     #[error("could not start Nix while checking commit {commit}: {source}")]
