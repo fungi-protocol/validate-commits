@@ -165,7 +165,7 @@ fn stops_when_a_selected_commits_check_fails() {
     let passing = fixture.commit("Passing commit");
     let failing = fixture.flake_commit("Failing commit", FAILING);
     fixture.flake_commit("Passing tip", PASSING);
-    let output = fixture.run_args(&["--all", &format!("^{base}")]);
+    let output = fixture.run(&format!("{base}..HEAD"));
     assert!(!output.status.success());
     assert_eq!(validated(&output), [passing, failing]);
     let error = String::from_utf8_lossy(&output.stderr);
@@ -188,7 +188,7 @@ fn checks_a_commit_at_a_shallow_boundary() {
     fs::remove_file(objects.join(&parent[..2]).join(&parent[2..])).unwrap();
     let shallow = fixture.repository.commondir().join("shallow");
     fs::write(&shallow, format!("{head}\n")).unwrap();
-    let output = fixture.run("HEAD^!");
+    let output = fixture.run("HEAD");
     assert!(
         output.status.success(),
         "{}",
