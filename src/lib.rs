@@ -7,10 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 pub fn run_revisions(revisions: &[&str], all: bool, output: &mut impl Write) -> Result<(), Error> {
-    if revisions.is_empty() && !all {
-        return Err(Error::MissingRevisions);
-    }
-    let repository = DiscoverRepository.run()?;
+    let repository = discover_repository()?;
     let commits = history::resolve_commits(&repository.git_repo, revisions, all)?;
 
     if commits.is_empty() {
@@ -32,18 +29,14 @@ struct Repository {
     root: PathBuf,
 }
 
-struct DiscoverRepository;
-
-impl DiscoverRepository {
-    fn run(self) -> Result<Repository, Error> {
-        let git_repo = git2::Repository::discover(".").map_err(Error::DiscoverRepository)?;
-        let root = git_repo
-            .workdir()
-            .ok_or(Error::BareRepository)?
-            .canonicalize()
-            .map_err(Error::CanonicalizeRepository)?;
-        Ok(Repository { git_repo, root })
-    }
+fn discover_repository() -> Result<Repository, Error> {
+    let git_repo = git2::Repository::discover(".").map_err(Error::DiscoverRepository)?;
+    let root = git_repo
+        .workdir()
+        .ok_or(Error::BareRepository)?
+        .canonicalize()
+        .map_err(Error::CanonicalizeRepository)?;
+    Ok(Repository { git_repo, root })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,8 +50,6 @@ impl fmt::Display for CommitId {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("provide at least one revision or select all refs")]
-    MissingRevisions,
     #[error("could not discover the Git repository: {0}")]
     DiscoverRepository(#[source] git2::Error),
     #[error("cannot validate a bare Git repository")]
