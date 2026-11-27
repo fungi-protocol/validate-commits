@@ -1,4 +1,5 @@
 mod history;
+mod mutants;
 mod nix;
 mod shallow;
 #[cfg(test)]
@@ -21,7 +22,7 @@ pub fn run_revisions(revisions: &[&str], output: &mut impl Write) -> Result<(), 
     for commit in &commits {
         writeln!(output, "Validating {commit}").map_err(Error::WriteOutput)?;
         output.flush().map_err(Error::WriteOutput)?;
-        nix::check_flake(&repository, commit)?;
+        nix::check_flake(&mut repository, commit)?;
     }
 
     Ok(())
@@ -83,6 +84,20 @@ pub enum Error {
     MissingFetchedCommit(git2::Oid),
     #[error("fetch did not deepen history; origin may itself be shallow")]
     NoHistoryProgress,
+    #[error("could not prepare the mutation diff for commit {commit}: {source}")]
+    MutationDiff {
+        commit: CommitId,
+        source: git2::Error,
+    },
+    #[error("could not parse flake.lock for commit {commit}: {source}")]
+    ParseLock {
+        commit: CommitId,
+        source: serde_json::Error,
+    },
+    #[error("could not write the mutation diff: {0}")]
+    WriteMutationDiff(#[source] std::io::Error),
+    #[error("the mutants-diff input in commit {commit} must be declared with `flake = false`")]
+    MutantsDiffIsFlake { commit: CommitId },
     #[error("could not write output: {0}")]
     WriteOutput(#[source] std::io::Error),
     #[error("could not start Nix while checking commit {commit}: {source}")]
